@@ -742,3 +742,127 @@ def withdraw_request(store: Store, user: str, amount_cents: int, to: str, memo: 
     avail = now_ts() + delay
     t = _ticket(user, to, net, False, 0, memo)
 
+    pw = PendingWithdrawal(
+        ticket=t,
+        user=user,
+        to=to,
+        amount_cents=net,
+        fee_cents=fee,
+        available_at=avail,
+        created_at=now_ts(),
+        from_vault=False,
+        vault_id=0,
+        memo=memo,
+    )
+    store.pending.setdefault(user, {})[t] = pw
+    _emit_ai(store, user, -_ai_score(store.policy, user, net, False), "withdraw_request")
+    _audit_push(store, _audit_digest("w_req", user, to, amount_cents, fee, avail, memo))
+    return t
+
+
+def withdraw_cancel(store: Store, user: str, ticket: str) -> None:
+    user = _norm_user(user)
+    ps = store.pending.get(user) or {}
+    p = ps.get(ticket)
+    if not p:
+        raise NotFoundError("Ticket not found")
+    if p.from_vault:
+        raise ValidationError("Use vault withdraw execute (vault requests cannot be cancelled here)")
+    # fee stays charged by design
+    refund = p.amount_cents
+    del ps[ticket]
+    a = _ensure_account(store, user)
+    a.checking_cents += refund
+    store.liabilities_cents += refund
+    _audit_push(store, _audit_digest("w_can", user, ticket, refund))
+
+
+def withdraw_execute(store: Store, user: str, ticket: str) -> Dict[str, Any]:
+    user = _norm_user(user)
+    ps = store.pending.get(user) or {}
+    p = ps.get(ticket)
+    if not p:
+        raise NotFoundError("Ticket not found")
+    if p.from_vault:
+        raise ValidationError("Ticket is a vault withdrawal; use vault-withdraw-execute")
+    if now_ts() < p.available_at:
+        raise NotReadyError(p.available_at)
+    del ps[ticket]
+    # execution is a "finalize" (we don't have an external bank transfer; we record it)
+    _audit_push(store, _audit_digest("w_exe", user, p.to, p.amount_cents, ticket))
+    return {"to": p.to, "amount_cents": p.amount_cents, "fee_cents": p.fee_cents, "memo": p.memo}
+
+
+def vault_withdraw_request(
+    store: Store,
+    user: str,
+    vault_id: int,
+    amount_cents: int,
+    to: str,
+    memo: str,
+    delay_seconds: Optional[int] = None,
+) -> str:
+    user = _norm_user(user)
+    to = _norm_user(to)
+    memo = _norm_memo(memo)
+    if amount_cents <= 0:
+        raise ValidationError("Amount must be > 0")
+    if amount_cents > store.policy.per_tx_max_cents:
+        raise ValidationError("Amount exceeds per-tx max policy")
+    a = _ensure_account(store, user)
+    _cooldown(a, store)
+    _touch_day(a, store, amount_cents)
+
+    v = _get_vault(store, user, vault_id)
+    _vault_unlocked(v)
+    if v.balance_cents < amount_cents:
+        raise ValidationError("Insufficient vault balance")
+
+    fee = _fee(amount_cents, store.policy.vault_withdraw_fee_bps)
+    net = amount_cents - fee
+    if net <= 0:
+        raise ValidationError("Amount too small after fee")
+
+    v.balance_cents -= amount_cents
+    store.liabilities_cents -= amount_cents
+    a.last_request_at = now_ts()
+
+    base_delay = store.policy.vault_withdraw_delay_seconds
+    if v.mode == VaultMode.FORTRESS:
+        base_delay = int(base_delay + (base_delay // 2))
+
+    delay = base_delay if delay_seconds is None else int(delay_seconds)
+    delay = clamp(delay, 60, 90 * 86_400)
+    avail = now_ts() + delay
+    t = _ticket(user, to, net, True, vault_id, memo)
+    pw = PendingWithdrawal(
+        ticket=t,
+        user=user,
+        to=to,
+        amount_cents=net,
+        fee_cents=fee,
+        available_at=avail,
+        created_at=now_ts(),
+        from_vault=True,
+        vault_id=vault_id,
+        memo=memo,
+    )
+    store.pending.setdefault(user, {})[t] = pw
+
+    if v.mode == VaultMode.GOALGATE and v.goal_cents > 0:
+        if amount_cents > v.goal_cents:
+            _emit_ai(store, user, -_ai_score(store.policy, user, amount_cents, True), "vault_goal_gate")
+        else:
+            _emit_ai(store, user, _ai_score(store.policy, user, amount_cents, True), "vault_goal_gate_ok")
+    else:
+        _emit_ai(store, user, -_ai_score(store.policy, user, net, True), "vault_withdraw_request")
+
+    _audit_push(store, _audit_digest("vw_req", user, vault_id, to, amount_cents, fee, avail, memo))
+    return t
+
+
+def vault_withdraw_execute(store: Store, user: str, ticket: str) -> Dict[str, Any]:
+    user = _norm_user(user)
+    ps = store.pending.get(user) or {}
+    p = ps.get(ticket)
+    if not p:
