@@ -618,3 +618,127 @@ def vault_create(store: Store, user: str, label: str, goal_cents: int, unlock_at
         raise ValidationError("Goal cannot be negative")
     if unlock_at < 0:
         raise ValidationError("Unlock time cannot be negative")
+    if unlock_at and unlock_at < now_ts():
+        raise ValidationError("Unlock time must be in the future")
+
+    _ensure_account(store, user)
+    vs = store.vaults.setdefault(user, {})
+    next_id = 1 + max([int(k) for k in vs.keys()] or [0])
+    spice32 = _rand_spice32()
+    v = Vault(
+        vault_id=next_id,
+        label=label,
+        label_hash=_label_hash(label, spice32),
+        mode=mode,
+        created_at=now_ts(),
+        unlock_at=unlock_at,
+        goal_cents=goal_cents,
+        balance_cents=0,
+        spice32=spice32,
+    )
+    vs[str(next_id)] = v
+    _audit_push(store, _audit_digest("vault_new", user, next_id, v.label_hash[:12], mode, goal_cents, unlock_at))
+    return next_id
+
+
+def _get_vault(store: Store, user: str, vault_id: int) -> Vault:
+    user = _norm_user(user)
+    vs = store.vaults.get(user) or {}
+    v = vs.get(str(vault_id))
+    if not v:
+        raise NotFoundError(f"Vault not found: {vault_id}")
+    return v
+
+
+def vault_set_goal(store: Store, user: str, vault_id: int, goal_cents: int) -> None:
+    user = _norm_user(user)
+    if goal_cents < 0:
+        raise ValidationError("Goal cannot be negative")
+    v = _get_vault(store, user, vault_id)
+    v.goal_cents = goal_cents
+    _emit_ai(store, user, _ai_score(store.policy, user, goal_cents, True), "vault_goal")
+    _audit_push(store, _audit_digest("vault_goal", user, vault_id, goal_cents))
+
+
+def vault_set_unlock(store: Store, user: str, vault_id: int, unlock_at: int) -> None:
+    user = _norm_user(user)
+    if unlock_at < 0:
+        raise ValidationError("Unlock time cannot be negative")
+    v = _get_vault(store, user, vault_id)
+    if v.unlock_at and unlock_at and unlock_at < v.unlock_at:
+        raise ValidationError("Cannot shorten unlock time (only extend)")
+    if unlock_at and unlock_at < now_ts():
+        raise ValidationError("Unlock time must be in the future")
+    v.unlock_at = unlock_at
+    _audit_push(store, _audit_digest("vault_unlock", user, vault_id, unlock_at))
+
+
+def move_to_vault(store: Store, user: str, vault_id: int, amount_cents: int) -> None:
+    user = _norm_user(user)
+    if amount_cents <= 0:
+        raise ValidationError("Amount must be > 0")
+    a = _ensure_account(store, user)
+    v = _get_vault(store, user, vault_id)
+    if a.checking_cents < amount_cents:
+        raise ValidationError("Insufficient checking balance")
+
+    a.checking_cents -= amount_cents
+    store.liabilities_cents -= amount_cents
+    v.balance_cents += amount_cents
+    store.liabilities_cents += amount_cents
+    _emit_ai(store, user, _ai_score(store.policy, user, amount_cents, True), "move_to_vault")
+    _audit_push(store, _audit_digest("to_vault", user, vault_id, amount_cents))
+
+
+def _vault_unlocked(v: Vault) -> None:
+    if v.unlock_at and now_ts() < v.unlock_at:
+        raise ValidationError(f"Vault locked until {fmt_dt(v.unlock_at)}")
+
+
+def move_from_vault(store: Store, user: str, vault_id: int, amount_cents: int) -> None:
+    user = _norm_user(user)
+    if amount_cents <= 0:
+        raise ValidationError("Amount must be > 0")
+    a = _ensure_account(store, user)
+    v = _get_vault(store, user, vault_id)
+    _vault_unlocked(v)
+    if v.balance_cents < amount_cents:
+        raise ValidationError("Insufficient vault balance")
+
+    v.balance_cents -= amount_cents
+    store.liabilities_cents -= amount_cents
+    a.checking_cents += amount_cents
+    store.liabilities_cents += amount_cents
+    _emit_ai(store, user, -_ai_score(store.policy, user, amount_cents, True), "move_from_vault")
+    _audit_push(store, _audit_digest("from_vault", user, vault_id, amount_cents))
+
+
+def withdraw_request(store: Store, user: str, amount_cents: int, to: str, memo: str, delay_seconds: Optional[int] = None) -> str:
+    user = _norm_user(user)
+    to = _norm_user(to)
+    memo = _norm_memo(memo)
+    if amount_cents <= 0:
+        raise ValidationError("Amount must be > 0")
+    if amount_cents > store.policy.per_tx_max_cents:
+        raise ValidationError("Amount exceeds per-tx max policy")
+    a = _ensure_account(store, user)
+    _cooldown(a, store)
+    _touch_day(a, store, amount_cents)
+
+    fee = _fee(amount_cents, store.policy.withdraw_fee_bps)
+    net = amount_cents - fee
+    total = amount_cents + fee
+    if net <= 0:
+        raise ValidationError("Amount too small after fee")
+    if a.checking_cents < total:
+        raise ValidationError("Insufficient checking balance")
+
+    a.checking_cents -= total
+    store.liabilities_cents -= total
+    a.last_request_at = now_ts()
+
+    delay = store.policy.withdraw_delay_seconds if delay_seconds is None else int(delay_seconds)
+    delay = clamp(delay, 60, 45 * 86_400)
+    avail = now_ts() + delay
+    t = _ticket(user, to, net, False, 0, memo)
+
