@@ -122,3 +122,127 @@ def parse_money_to_cents(text: str) -> int:
     Parse a money amount into integer cents.
     Accepts "12", "12.3", "12.34", "12,34". Leading +/-. No currency symbols.
     """
+    m = _MONEY_RE.match(text or "")
+    if not m:
+        raise ValidationError(f"Bad amount: {text!r}")
+    sign = -1 if m.group(1) == "-" else 1
+    whole = int(m.group(2))
+    frac = m.group(3) or "0"
+    frac = (frac + "0")[:2]
+    cents = whole * 100 + int(frac)
+    return sign * cents
+
+
+def cents_to_money(cents: int) -> str:
+    sign = "-" if cents < 0 else ""
+    cents = abs(cents)
+    return f"{sign}{cents // 100:,}.{cents % 100:02d}"
+def fmt_dt(ts: int) -> str:
+    return _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+def fmt_rel(seconds: int) -> str:
+    seconds = int(seconds)
+    if seconds < 0:
+        seconds = -seconds
+        prefix = "-"
+    else:
+        prefix = ""
+    mins, sec = divmod(seconds, 60)
+    hrs, mins = divmod(mins, 60)
+    days, hrs = divmod(hrs, 24)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hrs:
+        parts.append(f"{hrs}h")
+    if mins:
+        parts.append(f"{mins}m")
+    if sec and not parts:
+        parts.append(f"{sec}s")
+    return prefix + (" ".join(parts) if parts else "0s")
+
+
+# =========================
+# Domain model
+# =========================
+
+
+class VaultMode:
+    BASIC = "basic"
+    TIMELOCK = "timelock"
+    GOALGATE = "goalgate"
+    FORTRESS = "fortress"
+
+    ALL = (BASIC, TIMELOCK, GOALGATE, FORTRESS)
+
+
+def _rand_spice32() -> int:
+    return secrets.randbits(32)
+
+
+@dataclass
+class Vault:
+    vault_id: int
+    label: str
+    label_hash: str
+    mode: str
+    created_at: int
+    unlock_at: int
+    goal_cents: int
+    balance_cents: int
+    spice32: int
+
+    def to_json(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    @staticmethod
+    def from_json(d: Dict[str, Any]) -> "Vault":
+        return Vault(**d)
+
+
+@dataclass
+class PendingWithdrawal:
+    ticket: str
+    user: str
+    to: str
+    amount_cents: int
+    fee_cents: int
+    available_at: int
+    created_at: int
+    from_vault: bool
+    vault_id: int
+    memo: str
+
+    def to_json(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    @staticmethod
+    def from_json(d: Dict[str, Any]) -> "PendingWithdrawal":
+        return PendingWithdrawal(**d)
+
+
+@dataclass
+class Schedule:
+    schedule_id: str
+    user: str
+    vault_id: int
+    amount_cents: int
+    every_seconds: int
+    next_at: int
+    start_at: int
+    end_at: int
+    live: bool
+    flags32: int
+    memo: str
+
+    def to_json(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    @staticmethod
+    def from_json(d: Dict[str, Any]) -> "Schedule":
+        return Schedule(**d)
+
+
+@dataclass
+class Account:
+    user: str
+    checking_cents: int
