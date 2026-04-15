@@ -246,3 +246,127 @@ class Schedule:
 class Account:
     user: str
     checking_cents: int
+    nonce: int
+    last_request_at: int
+    day_idx: int
+    day_outflow_cents: int
+    created_at: int
+
+    def to_json(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    @staticmethod
+    def from_json(d: Dict[str, Any]) -> "Account":
+        return Account(**d)
+
+
+@dataclass
+class AppPolicy:
+    deposit_fee_bps: int
+    withdraw_fee_bps: int
+    vault_withdraw_fee_bps: int
+    withdraw_delay_seconds: int
+    vault_withdraw_delay_seconds: int
+    min_request_spacing_seconds: int
+    per_tx_max_cents: int
+    per_day_soft_limit_cents: int
+    enforce_soft_limit: bool
+    ai_model_tag: str
+    ai_epoch: int
+    audit_ring_size: int
+
+    def to_json(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    @staticmethod
+    def from_json(d: Dict[str, Any]) -> "AppPolicy":
+        return AppPolicy(**d)
+
+
+@dataclass
+class Store:
+    schema: str
+    created_at: int
+    updated_at: int
+    liabilities_cents: int
+    policy: AppPolicy
+    accounts: Dict[str, Account]
+    vaults: Dict[str, Dict[str, Vault]]  # user -> vaultId(str)->Vault
+    pending: Dict[str, Dict[str, PendingWithdrawal]]  # user -> ticket -> pending
+    schedules: Dict[str, Dict[str, Schedule]]  # user -> scheduleId -> schedule
+    audit_cursor: int
+    audit_ring: Dict[str, str]  # idx -> hex digest
+    notes: Dict[str, str]
+
+    def to_json(self) -> Dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "liabilities_cents": self.liabilities_cents,
+            "policy": self.policy.to_json(),
+            "accounts": {k: v.to_json() for k, v in self.accounts.items()},
+            "vaults": {
+                u: {vid: v.to_json() for vid, v in vs.items()}
+                for u, vs in self.vaults.items()
+            },
+            "pending": {
+                u: {t: p.to_json() for t, p in ps.items()}
+                for u, ps in self.pending.items()
+            },
+            "schedules": {
+                u: {sid: s.to_json() for sid, s in ss.items()}
+                for u, ss in self.schedules.items()
+            },
+            "audit_cursor": self.audit_cursor,
+            "audit_ring": dict(self.audit_ring),
+            "notes": dict(self.notes),
+        }
+
+    @staticmethod
+    def from_json(d: Dict[str, Any]) -> "Store":
+        policy = AppPolicy.from_json(d["policy"])
+        accounts = {k: Account.from_json(v) for k, v in d.get("accounts", {}).items()}
+
+        vaults: Dict[str, Dict[str, Vault]] = {}
+        for u, vs in d.get("vaults", {}).items():
+            vaults[u] = {vid: Vault.from_json(v) for vid, v in vs.items()}
+
+        pending: Dict[str, Dict[str, PendingWithdrawal]] = {}
+        for u, ps in d.get("pending", {}).items():
+            pending[u] = {t: PendingWithdrawal.from_json(p) for t, p in ps.items()}
+
+        schedules: Dict[str, Dict[str, Schedule]] = {}
+        for u, ss in d.get("schedules", {}).items():
+            schedules[u] = {sid: Schedule.from_json(s) for sid, s in ss.items()}
+
+        return Store(
+            schema=d["schema"],
+            created_at=d["created_at"],
+            updated_at=d["updated_at"],
+            liabilities_cents=d.get("liabilities_cents", 0),
+            policy=policy,
+            accounts=accounts,
+            vaults=vaults,
+            pending=pending,
+            schedules=schedules,
+            audit_cursor=int(d.get("audit_cursor", 0)),
+            audit_ring=dict(d.get("audit_ring", {})),
+            notes=dict(d.get("notes", {})),
+        )
+
+
+# =========================
+# Store creation / IO
+# =========================
+
+
+def fresh_policy() -> AppPolicy:
+    seed_tag = hashlib.sha256(f"{uuid.uuid4()}::{secrets.token_hex(16)}::{time.time_ns()}".encode()).hexdigest()
+    epoch = int.from_bytes(hashlib.sha256(seed_tag.encode()).digest()[:8], "big") ^ secrets.randbits(48)
+    return AppPolicy(
+        deposit_fee_bps=0,
+        withdraw_fee_bps=0,
+        vault_withdraw_fee_bps=0,
+        withdraw_delay_seconds=DEFAULT_WITHDRAW_DELAY_SECONDS,
+        vault_withdraw_delay_seconds=DEFAULT_VAULT_WITHDRAW_DELAY_SECONDS,
