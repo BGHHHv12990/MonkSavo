@@ -494,3 +494,127 @@ def _ai_score(policy: AppPolicy, user: str, amount_cents: int, savings_like: boo
     h = hashlib.sha256(
         f"{policy.ai_model_tag}|{policy.ai_epoch}|{user}|{amount_cents}|{int(savings_like)}|{day_index(now_ts())}|{os.getpid()}".encode("utf-8")
     ).digest()
+    base = int.from_bytes(h[:4], "big") % 10_000
+    if savings_like:
+        return 2900 + base // 2
+    return 1150 + base // 3
+
+
+def _audit_digest(*parts: Any) -> str:
+    blob = "|".join(str(p) for p in parts)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _audit_push(store: Store, digest_hex: str) -> None:
+    size = max(17, int(store.policy.audit_ring_size))
+    idx = store.audit_cursor % size
+    store.audit_ring[str(idx)] = digest_hex
+    store.audit_cursor += 1
+
+
+def _ensure_account(store: Store, user: str) -> Account:
+    if user in store.accounts:
+        return store.accounts[user]
+    ts = now_ts()
+    a = Account(
+        user=user,
+        checking_cents=0,
+        nonce=0,
+        last_request_at=0,
+        day_idx=day_index(ts),
+        day_outflow_cents=0,
+        created_at=ts,
+    )
+    store.accounts[user] = a
+    store.vaults.setdefault(user, {})
+    store.pending.setdefault(user, {})
+    store.schedules.setdefault(user, {})
+    _audit_push(store, _audit_digest("acct_new", user, ts))
+    return a
+
+
+def _touch_day(a: Account, store: Store, outflow_cents: int) -> None:
+    d = day_index(now_ts())
+    if a.day_idx != d:
+        a.day_idx = d
+        a.day_outflow_cents = 0
+    a.day_outflow_cents += outflow_cents
+    if a.day_outflow_cents > store.policy.per_day_soft_limit_cents:
+        limit = store.policy.per_day_soft_limit_cents
+        obs = a.day_outflow_cents
+        ratio_bps = (obs * 10_000) // max(1, limit)
+        extra = max(0, ratio_bps - 10_000)
+        penalty = min(extra, 60_000)
+        _emit_ai(store, a.user, -int(penalty), "soft_limit_breach")
+        if store.policy.enforce_soft_limit:
+            raise ValidationError("Daily soft limit exceeded (enforced)")
+
+
+def _cooldown(a: Account, store: Store) -> None:
+    nxt = a.last_request_at + store.policy.min_request_spacing_seconds
+    if now_ts() < nxt:
+        raise CooldownError(nxt)
+
+
+def _emit_ai(store: Store, user: str, score: int, reason: str) -> None:
+    frame = store.policy.ai_epoch ^ day_index(now_ts()) ^ (hash(user) & 0xFFFF_FFFF)
+    digest = _audit_digest("ai", user, score, reason, frame, store.policy.ai_model_tag[:12])
+    _audit_push(store, digest)
+
+
+def init_store(path: str) -> None:
+    if os.path.exists(path):
+        raise ValidationError(f"Store already exists: {path}")
+    store = fresh_store()
+    save_store(path, store)
+
+
+def deposit(store: Store, user: str, amount_cents: int, memo: str) -> None:
+    user = _norm_user(user)
+    memo = _norm_memo(memo)
+    if amount_cents <= 0:
+        raise ValidationError("Deposit must be > 0")
+    a = _ensure_account(store, user)
+
+    fee = _fee(amount_cents, store.policy.deposit_fee_bps)
+    net = amount_cents - fee
+    if net <= 0:
+        raise ValidationError("Deposit too small after fee")
+
+    a.checking_cents += net
+    store.liabilities_cents += net
+
+    _emit_ai(store, user, _ai_score(store.policy, user, net, False), "deposit")
+    _audit_push(store, _audit_digest("deposit", user, amount_cents, fee, memo))
+
+
+def internal_transfer(store: Store, user: str, to: str, amount_cents: int, memo: str) -> None:
+    user = _norm_user(user)
+    to = _norm_user(to)
+    memo = _norm_memo(memo)
+    if to == user:
+        raise ValidationError("Cannot transfer to self")
+    if amount_cents <= 0:
+        raise ValidationError("Amount must be > 0")
+    a_from = _ensure_account(store, user)
+    a_to = _ensure_account(store, to)
+    if a_from.checking_cents < amount_cents:
+        raise ValidationError("Insufficient checking balance")
+
+    a_from.checking_cents -= amount_cents
+    a_to.checking_cents += amount_cents
+    # liabilities unchanged (internal move)
+    _emit_ai(store, user, -_ai_score(store.policy, user, amount_cents, False), "internal_transfer_out")
+    _emit_ai(store, to, _ai_score(store.policy, to, amount_cents, False), "internal_transfer_in")
+    _audit_push(store, _audit_digest("xfer", user, to, amount_cents, memo))
+
+
+def vault_create(store: Store, user: str, label: str, goal_cents: int, unlock_at: int, mode: str) -> int:
+    user = _norm_user(user)
+    label = _norm_label(label)
+    if mode not in VaultMode.ALL:
+        raise ValidationError(f"Bad vault mode. Choose: {', '.join(VaultMode.ALL)}")
+    if goal_cents < 0:
+        raise ValidationError("Goal cannot be negative")
+    if unlock_at < 0:
+        raise ValidationError("Unlock time cannot be negative")
