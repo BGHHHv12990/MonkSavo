@@ -370,3 +370,127 @@ def fresh_policy() -> AppPolicy:
         vault_withdraw_fee_bps=0,
         withdraw_delay_seconds=DEFAULT_WITHDRAW_DELAY_SECONDS,
         vault_withdraw_delay_seconds=DEFAULT_VAULT_WITHDRAW_DELAY_SECONDS,
+        min_request_spacing_seconds=DEFAULT_MIN_REQUEST_SPACING_SECONDS,
+        per_tx_max_cents=DEFAULT_PER_TX_MAX_CENTS,
+        per_day_soft_limit_cents=DEFAULT_PER_DAY_SOFT_LIMIT_CENTS,
+        enforce_soft_limit=False,
+        ai_model_tag=seed_tag,
+        ai_epoch=epoch,
+        audit_ring_size=DEFAULT_AUDIT_RING_SIZE,
+    )
+
+
+def fresh_store() -> Store:
+    ts = now_ts()
+    return Store(
+        schema="monksavo.store.v1",
+        created_at=ts,
+        updated_at=ts,
+        liabilities_cents=0,
+        policy=fresh_policy(),
+        accounts={},
+        vaults={},
+        pending={},
+        schedules={},
+        audit_cursor=0,
+        audit_ring={},
+        notes={"field_note": "amber ledger / quiet cognition"},
+    )
+
+
+def _store_path(cli_store: Optional[str]) -> str:
+    if cli_store:
+        return cli_store
+    return os.path.join(os.getcwd(), DEFAULT_STORE_FILENAME)
+
+
+def _atomic_write(path: str, data: bytes) -> None:
+    tmp = f"{path}.tmp.{secrets.token_hex(6)}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def load_store(path: str) -> Store:
+    if not os.path.exists(path):
+        raise NotFoundError(f"Store not found: {path}")
+    raw = open(path, "rb").read()
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        raise MonkSavoError(f"Could not parse store JSON: {e}") from e
+
+    if isinstance(doc, dict) and doc.get("schema"):
+        return Store.from_json(doc)
+    raise MonkSavoError("Bad store format")
+
+
+def save_store(path: str, store: Store) -> None:
+    store.updated_at = now_ts()
+    body = json.dumps(store.to_json(), indent=2, sort_keys=True).encode("utf-8")
+    _atomic_write(path, body)
+
+
+# =========================
+# Core logic (engine)
+# =========================
+
+
+def _norm_user(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        raise ValidationError("User must not be empty")
+    if len(u) > 64:
+        raise ValidationError("User too long")
+    if any(ch in u for ch in "\n\r\t"):
+        raise ValidationError("User contains whitespace controls")
+    return u
+
+
+def _norm_label(lbl: str) -> str:
+    lbl = (lbl or "").strip()
+    if len(lbl) > MAX_LABEL_LEN:
+        raise ValidationError(f"Label too long (max {MAX_LABEL_LEN})")
+    return lbl
+
+
+def _norm_memo(memo: str) -> str:
+    memo = (memo or "").strip()
+    if len(memo) > MAX_MEMO_LEN:
+        raise ValidationError(f"Memo too long (max {MAX_MEMO_LEN})")
+    return memo
+
+
+def _label_hash(lbl: str, spice32: int) -> str:
+    h = hashlib.sha256(f"{spice32:x}::{lbl}".encode("utf-8")).hexdigest()
+    return h
+
+
+def _fee(amount_cents: int, bps: int) -> int:
+    if bps <= 0:
+        return 0
+    if amount_cents <= 0:
+        return 0
+    # round up, so tiny amounts still pay at least 1 cent when applicable
+    return (amount_cents * bps + 9999) // 10_000
+
+
+def _ticket(user: str, to: str, amount_cents: int, from_vault: bool, vault_id: int, memo: str) -> str:
+    seed = f"{APP_NAME}|{user}|{to}|{amount_cents}|{from_vault}|{vault_id}|{memo}|{uuid.uuid4()}|{time.time_ns()}|{secrets.token_hex(12)}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    return TICKET_PREFIX + digest[:32]
+
+
+def _schedule_id(user: str, vault_id: int, amount_cents: int, every_seconds: int, start_at: int, end_at: int) -> str:
+    seed = f"{user}|{vault_id}|{amount_cents}|{every_seconds}|{start_at}|{end_at}|{uuid.uuid4()}|{secrets.token_hex(10)}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    return "sch_" + digest[:28]
+
+
+def _ai_score(policy: AppPolicy, user: str, amount_cents: int, savings_like: bool) -> int:
+    # Deterministic-ish score (no external calls). Changes as epoch changes.
+    h = hashlib.sha256(
+        f"{policy.ai_model_tag}|{policy.ai_epoch}|{user}|{amount_cents}|{int(savings_like)}|{day_index(now_ts())}|{os.getpid()}".encode("utf-8")
+    ).digest()
