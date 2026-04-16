@@ -1362,3 +1362,127 @@ def cmd_move_from_vault(args: argparse.Namespace) -> None:
     user = _norm_user(args.user)
     vid = int(args.vault_id)
     amt = parse_money_to_cents(args.amount)
+    move_from_vault(store, user, vid, amt)
+    save_store(path, store)
+    print(c_ok(f"Moved {cents_to_money(amt)} from vault #{vid} -> checking"))
+
+
+def cmd_withdraw_request(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    to = _norm_user(args.to)
+    amt = parse_money_to_cents(args.amount)
+    memo = args.memo or ""
+    delay = parse_duration(args.delay) if args.delay else None
+    t = withdraw_request(store, user, amt, to, memo, delay_seconds=delay)
+    save_store(path, store)
+    p = store.pending[user][t]
+    print(c_ok(f"Withdrawal requested. ticket={t} available_at={fmt_dt(p.available_at)} net={cents_to_money(p.amount_cents)} fee={cents_to_money(p.fee_cents)}"))
+
+
+def cmd_withdraw_cancel(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    withdraw_cancel(store, user, args.ticket)
+    save_store(path, store)
+    print(c_ok("Cancelled withdrawal request (net refunded; fee retained)."))
+
+
+def cmd_withdraw_execute(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    row = withdraw_execute(store, user, args.ticket)
+    save_store(path, store)
+    print(c_ok(f"Executed withdrawal to {row['to']} amount={cents_to_money(row['amount_cents'])} (fee={cents_to_money(row['fee_cents'])}) memo={row['memo']!r}"))
+
+
+def cmd_vault_withdraw_request(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    to = _norm_user(args.to)
+    vid = int(args.vault_id)
+    amt = parse_money_to_cents(args.amount)
+    memo = args.memo or ""
+    delay = parse_duration(args.delay) if args.delay else None
+    t = vault_withdraw_request(store, user, vid, amt, to, memo, delay_seconds=delay)
+    save_store(path, store)
+    p = store.pending[user][t]
+    print(c_ok(f"Vault withdrawal requested. ticket={t} available_at={fmt_dt(p.available_at)} net={cents_to_money(p.amount_cents)} fee={cents_to_money(p.fee_cents)}"))
+
+
+def cmd_vault_withdraw_execute(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    row = vault_withdraw_execute(store, user, args.ticket)
+    save_store(path, store)
+    print(
+        c_ok(
+            f"Executed vault withdrawal vault=#{row['vault_id']} to={row['to']} amount={cents_to_money(row['amount_cents'])} fee={cents_to_money(row['fee_cents'])}"
+        )
+    )
+
+
+def cmd_pending(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    rows = list_pending(store, user)
+    print(_banner())
+    if not rows:
+        print("(no pending withdrawals)")
+        return
+    for p in rows:
+        kind = "vault" if p.from_vault else "checking"
+        ready_in = p.available_at - now_ts()
+        print(
+            f"- {p.ticket}  kind={kind:<8} to={p.to:<16} net={cents_to_money(p.amount_cents):>12} fee={cents_to_money(p.fee_cents):>8} ready={fmt_dt(p.available_at)} ({fmt_rel(ready_in)}) memo={p.memo!r}"
+        )
+
+
+def cmd_schedule_create(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    vid = int(args.vault_id)
+    amt = parse_money_to_cents(args.amount)
+    every = parse_duration(args.every)
+    start_at = parse_time(args.start_at)
+    end_at = parse_time(args.end_at) if args.end_at else 0
+    memo = args.memo or ""
+    sid = schedule_create(store, user, vid, amt, every, start_at, end_at, memo)
+    save_store(path, store)
+    print(c_ok(f"Created schedule {sid} (next_at={fmt_dt(start_at)})"))
+
+
+def cmd_schedule_cancel(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    schedule_cancel(store, user, args.schedule_id)
+    save_store(path, store)
+    print(c_ok("Cancelled schedule."))
+
+
+def cmd_schedule_poke(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    row = schedule_poke(store, user, args.schedule_id, int(args.max_moves))
+    save_store(path, store)
+    moved = cents_to_money(row["moved_cents"])
+    print(c_ok(f"Poked schedule. moved={moved} moves={row['moves']} next_at={fmt_dt(row['next_at'])} live={int(row['live'])}"))
+
+
+def cmd_schedules(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    rows = list_schedules(store, user)
+    print(_banner())
+    if not rows:
+        print("(no schedules)")
