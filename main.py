@@ -1610,3 +1610,121 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_vault_unlock)
 
     sp = sub.add_parser("move-to-vault", help="Move funds from checking -> vault")
+    sp.add_argument("vault_id")
+    sp.add_argument("amount")
+    sp.add_argument("--user", required=True)
+    sp.set_defaults(func=cmd_move_to_vault)
+
+    sp = sub.add_parser("move-from-vault", help="Move funds from vault -> checking (if unlocked)")
+    sp.add_argument("vault_id")
+    sp.add_argument("amount")
+    sp.add_argument("--user", required=True)
+    sp.set_defaults(func=cmd_move_from_vault)
+
+    sp = sub.add_parser("withdraw-request", help="Request a staged withdrawal from checking")
+    sp.add_argument("amount")
+    sp.add_argument("--user", required=True)
+    sp.add_argument("--to", required=True)
+    sp.add_argument("--memo", default="")
+    sp.add_argument("--delay", default="", help='Override delay (e.g., "2h", "30m")')
+    sp.set_defaults(func=cmd_withdraw_request)
+
+    sp = sub.add_parser("withdraw-cancel", help="Cancel a pending checking withdrawal (fee retained)")
+    sp.add_argument("ticket")
+    sp.add_argument("--user", required=True)
+    sp.set_defaults(func=cmd_withdraw_cancel)
+
+    sp = sub.add_parser("withdraw-execute", help="Execute a matured checking withdrawal")
+    sp.add_argument("ticket")
+    sp.add_argument("--user", required=True)
+    sp.set_defaults(func=cmd_withdraw_execute)
+
+    sp = sub.add_parser("vault-withdraw-request", help="Request a staged withdrawal from a vault")
+    sp.add_argument("vault_id")
+    sp.add_argument("amount")
+    sp.add_argument("--user", required=True)
+    sp.add_argument("--to", required=True)
+    sp.add_argument("--memo", default="")
+    sp.add_argument("--delay", default="", help='Override delay (e.g., "8h")')
+    sp.set_defaults(func=cmd_vault_withdraw_request)
+
+    sp = sub.add_parser("vault-withdraw-execute", help="Execute a matured vault withdrawal")
+    sp.add_argument("ticket")
+    sp.add_argument("--user", required=True)
+    sp.set_defaults(func=cmd_vault_withdraw_execute)
+
+    sp = sub.add_parser("pending", help="List pending withdrawals for user")
+    sp.add_argument("--user", required=True)
+    sp.set_defaults(func=cmd_pending)
+
+    sp = sub.add_parser("schedule-create", help="Create a periodic checking->vault schedule (poke-based)")
+    sp.add_argument("--user", required=True)
+    sp.add_argument("--vault-id", required=True)
+    sp.add_argument("--amount", required=True)
+    sp.add_argument("--every", required=True, help='Duration like "1d" or "6h"')
+    sp.add_argument("--start-at", required=True, help='Time like "now+2h" or "2026-04-13T18:30"')
+    sp.add_argument("--end-at", default="", help="Optional end time")
+    sp.add_argument("--memo", default="")
+    sp.set_defaults(func=cmd_schedule_create)
+
+    sp = sub.add_parser("schedule-cancel", help="Cancel a schedule")
+    sp.add_argument("--user", required=True)
+    sp.add_argument("schedule_id")
+    sp.set_defaults(func=cmd_schedule_cancel)
+
+    sp = sub.add_parser("schedule-poke", help="Run due schedule moves (up to max-moves)")
+    sp.add_argument("--user", required=True)
+    sp.add_argument("schedule_id")
+    sp.add_argument("--max-moves", default="3")
+    sp.set_defaults(func=cmd_schedule_poke)
+
+    sp = sub.add_parser("schedules", help="List schedules for user")
+    sp.add_argument("--user", required=True)
+    sp.set_defaults(func=cmd_schedules)
+
+    sp = sub.add_parser("policy-show", help="Show current policy")
+    sp.set_defaults(func=cmd_policy_show)
+
+    sp = sub.add_parser("policy-set-fees", help="Set fee policy (bps)")
+    sp.add_argument("--deposit-bps", required=True)
+    sp.add_argument("--withdraw-bps", required=True)
+    sp.add_argument("--vault-withdraw-bps", required=True)
+    sp.set_defaults(func=cmd_policy_set_fees)
+
+    sp = sub.add_parser("policy-set-timing", help="Set timing policy (durations)")
+    sp.add_argument("--withdraw-delay", required=True)
+    sp.add_argument("--vault-withdraw-delay", required=True)
+    sp.add_argument("--min-spacing", required=True)
+    sp.set_defaults(func=cmd_policy_set_timing)
+
+    sp = sub.add_parser("policy-set-risk", help="Set risk policy")
+    sp.add_argument("--per-tx-max", required=True, help="Money amount")
+    sp.add_argument("--per-day-soft-limit", required=True, help="Money amount")
+    sp.add_argument("--enforce", action="store_true")
+    sp.set_defaults(func=cmd_policy_set_risk)
+
+    return p
+
+
+# =========================
+# Main
+# =========================
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        args.func(args)
+        return 0
+    except MonkSavoError as e:
+        print(c_bad(f"{APP_NAME} error: {e}"), file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print(c_warn("Interrupted."), file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
