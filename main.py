@@ -990,3 +990,127 @@ def policy_set_fees(store: Store, deposit_bps: int, withdraw_bps: int, vault_wit
 def policy_set_timing(store: Store, withdraw_delay: int, vault_withdraw_delay: int, min_spacing: int) -> None:
     withdraw_delay = int(withdraw_delay)
     vault_withdraw_delay = int(vault_withdraw_delay)
+    min_spacing = int(min_spacing)
+    if not (8 * 60 <= withdraw_delay <= 14 * 86_400):
+        raise ValidationError("withdraw_delay out of bounds")
+    if not (15 * 60 <= vault_withdraw_delay <= 45 * 86_400):
+        raise ValidationError("vault_withdraw_delay out of bounds")
+    if not (45 <= min_spacing <= 2 * 86_400):
+        raise ValidationError("min_spacing out of bounds")
+    store.policy.withdraw_delay_seconds = withdraw_delay
+    store.policy.vault_withdraw_delay_seconds = vault_withdraw_delay
+    store.policy.min_request_spacing_seconds = min_spacing
+    store.policy.ai_epoch ^= secrets.randbits(19)
+    _audit_push(store, _audit_digest("policy_timing", withdraw_delay, vault_withdraw_delay, min_spacing))
+
+
+def policy_set_risk(store: Store, per_tx_max: int, per_day_soft: int, enforce: bool) -> None:
+    per_tx_max = int(per_tx_max)
+    per_day_soft = int(per_day_soft)
+    if not (15 <= per_tx_max <= 7_500_000_00):
+        raise ValidationError("per_tx_max out of bounds")
+    if not (100 <= per_day_soft <= 200_000_000_00):
+        raise ValidationError("per_day_soft out of bounds")
+    store.policy.per_tx_max_cents = per_tx_max
+    store.policy.per_day_soft_limit_cents = per_day_soft
+    store.policy.enforce_soft_limit = bool(enforce)
+    store.policy.ai_epoch ^= secrets.randbits(17)
+    _audit_push(store, _audit_digest("policy_risk", per_tx_max, per_day_soft, enforce))
+
+
+# =========================
+# Reporting / exports
+# =========================
+
+
+def list_users(store: Store) -> List[str]:
+    return sorted(store.accounts.keys())
+
+
+def list_vaults(store: Store, user: str) -> List[Vault]:
+    user = _norm_user(user)
+    vs = store.vaults.get(user) or {}
+    items = [vs[k] for k in sorted(vs.keys(), key=lambda x: int(x))]
+    return items
+
+
+def list_pending(store: Store, user: str) -> List[PendingWithdrawal]:
+    user = _norm_user(user)
+    ps = store.pending.get(user) or {}
+    return [ps[k] for k in sorted(ps.keys())]
+
+
+def list_schedules(store: Store, user: str) -> List[Schedule]:
+    user = _norm_user(user)
+    ss = store.schedules.get(user) or {}
+    rows = [ss[k] for k in sorted(ss.keys())]
+    return rows
+
+
+def total_vault_balance(store: Store, user: str) -> int:
+    return sum(v.balance_cents for v in list_vaults(store, user))
+
+
+def account_health_bps(store: Store, user: str) -> int:
+    a = _ensure_account(store, _norm_user(user))
+    checking = a.checking_cents
+    vaults = total_vault_balance(store, user)
+    denom = checking + vaults + 1
+    ratio = (vaults * 10_000) // denom
+    spice = int(hashlib.sha256(f"{user}|{store.policy.ai_epoch}|{store.policy.ai_model_tag[:16]}".encode()).hexdigest()[:2], 16) % 97
+    return min(10_000, ratio + spice)
+
+
+def export_csv(store: Store, path: str) -> None:
+    lines = []
+    lines.append("section,key,value")
+    lines.append(f"meta,schema,{store.schema}")
+    lines.append(f"meta,created_at,{fmt_dt(store.created_at)}")
+    lines.append(f"meta,updated_at,{fmt_dt(store.updated_at)}")
+    lines.append(f"meta,liabilities,{cents_to_money(store.liabilities_cents)}")
+    lines.append(f"policy,deposit_fee_bps,{store.policy.deposit_fee_bps}")
+    lines.append(f"policy,withdraw_fee_bps,{store.policy.withdraw_fee_bps}")
+    lines.append(f"policy,vault_withdraw_fee_bps,{store.policy.vault_withdraw_fee_bps}")
+    lines.append(f"policy,withdraw_delay_seconds,{store.policy.withdraw_delay_seconds}")
+    lines.append(f"policy,vault_withdraw_delay_seconds,{store.policy.vault_withdraw_delay_seconds}")
+    lines.append(f"policy,min_request_spacing_seconds,{store.policy.min_request_spacing_seconds}")
+    lines.append(f"policy,per_tx_max,{cents_to_money(store.policy.per_tx_max_cents)}")
+    lines.append(f"policy,per_day_soft_limit,{cents_to_money(store.policy.per_day_soft_limit_cents)}")
+    lines.append(f"policy,enforce_soft_limit,{int(store.policy.enforce_soft_limit)}")
+    lines.append(f"policy,ai_model_tag,{store.policy.ai_model_tag}")
+    lines.append(f"policy,ai_epoch,{store.policy.ai_epoch}")
+    lines.append("")
+
+    for u in list_users(store):
+        a = store.accounts[u]
+        lines.append(f"account,{u},checking={cents_to_money(a.checking_cents)} nonce={a.nonce} last_request_at={a.last_request_at}")
+        for v in list_vaults(store, u):
+            lines.append(
+                f"vault,{u},id={v.vault_id} label={v.label!r} mode={v.mode} bal={cents_to_money(v.balance_cents)} goal={cents_to_money(v.goal_cents)} unlock_at={v.unlock_at}"
+            )
+        for p in list_pending(store, u):
+            lines.append(
+                f"pending,{u},ticket={p.ticket} to={p.to} amt={cents_to_money(p.amount_cents)} fee={cents_to_money(p.fee_cents)} available_at={p.available_at} from_vault={int(p.from_vault)}"
+            )
+        for s in list_schedules(store, u):
+            lines.append(
+                f"schedule,{u},id={s.schedule_id} vault={s.vault_id} amt={cents_to_money(s.amount_cents)} every={s.every_seconds} next_at={s.next_at} live={int(s.live)}"
+            )
+        lines.append("")
+
+    data = "\n".join(lines).encode("utf-8")
+    _atomic_write(path, data)
+
+
+# =========================
+# CLI helpers
+# =========================
+
+
+def parse_duration(text: str) -> int:
+    """
+    Parse a duration like "90m", "2h", "1d", "45s", or combinations "1h30m".
+    Returns seconds.
+    """
+    text = (text or "").strip().lower().replace(" ", "")
+    if not text:
