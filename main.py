@@ -1486,3 +1486,127 @@ def cmd_schedules(args: argparse.Namespace) -> None:
     print(_banner())
     if not rows:
         print("(no schedules)")
+        return
+    for s in rows:
+        print(
+            f"- {s.schedule_id} vault={s.vault_id:<3} amt={cents_to_money(s.amount_cents):>12} every={fmt_rel(s.every_seconds):>8} next={fmt_dt(s.next_at)} live={int(s.live)} memo={s.memo!r}"
+        )
+
+
+def cmd_policy_show(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    print(_banner())
+    rows = [
+        ("deposit_fee_bps", str(store.policy.deposit_fee_bps)),
+        ("withdraw_fee_bps", str(store.policy.withdraw_fee_bps)),
+        ("vault_withdraw_fee_bps", str(store.policy.vault_withdraw_fee_bps)),
+        ("withdraw_delay_seconds", fmt_rel(store.policy.withdraw_delay_seconds)),
+        ("vault_withdraw_delay_seconds", fmt_rel(store.policy.vault_withdraw_delay_seconds)),
+        ("min_request_spacing_seconds", fmt_rel(store.policy.min_request_spacing_seconds)),
+        ("per_tx_max", cents_to_money(store.policy.per_tx_max_cents)),
+        ("per_day_soft_limit", cents_to_money(store.policy.per_day_soft_limit_cents)),
+        ("enforce_soft_limit", str(int(store.policy.enforce_soft_limit))),
+        ("ai_model_tag", store.policy.ai_model_tag),
+        ("ai_epoch", str(store.policy.ai_epoch)),
+        ("audit_ring_size", str(store.policy.audit_ring_size)),
+    ]
+    _print_kv(rows)
+
+
+def cmd_policy_set_fees(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    policy_set_fees(store, int(args.deposit_bps), int(args.withdraw_bps), int(args.vault_withdraw_bps))
+    save_store(path, store)
+    print(c_ok("Updated fee policy."))
+
+
+def cmd_policy_set_timing(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    wd = parse_duration(args.withdraw_delay)
+    vwd = parse_duration(args.vault_withdraw_delay)
+    ms = parse_duration(args.min_spacing)
+    policy_set_timing(store, wd, vwd, ms)
+    save_store(path, store)
+    print(c_ok("Updated timing policy."))
+
+
+def cmd_policy_set_risk(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    per_tx = parse_money_to_cents(args.per_tx_max)
+    per_day = parse_money_to_cents(args.per_day_soft_limit)
+    policy_set_risk(store, per_tx, per_day, bool(args.enforce))
+    save_store(path, store)
+    print(c_ok("Updated risk policy."))
+
+
+# =========================
+# Argument parser
+# =========================
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="MonkSavo: local AI bank account + savings manager (single-file, stdlib-only).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Tip: run `MonkSavo.py init` then `MonkSavo.py status`.",
+    )
+    p.add_argument("--store", default=None, help=f"Store path (default: ./{DEFAULT_STORE_FILENAME})")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("init", help="Create a new store")
+    sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("status", help="Show store summary and policy")
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("users", help="List users")
+    sp.set_defaults(func=cmd_users)
+
+    sp = sub.add_parser("user-show", help="Show one user balances/health")
+    sp.add_argument("--user", required=True)
+    sp.set_defaults(func=cmd_user_show)
+
+    sp = sub.add_parser("deposit", help="Deposit into checking")
+    sp.add_argument("amount")
+    sp.add_argument("--user", required=True)
+    sp.add_argument("--memo", default="")
+    sp.set_defaults(func=cmd_deposit)
+
+    sp = sub.add_parser("transfer", help="Internal transfer checking -> checking")
+    sp.add_argument("amount")
+    sp.add_argument("--user", required=True)
+    sp.add_argument("--to", required=True)
+    sp.add_argument("--memo", default="")
+    sp.set_defaults(func=cmd_transfer)
+
+    sp = sub.add_parser("vault-create", help="Create a savings vault")
+    sp.add_argument("--user", required=True)
+    sp.add_argument("--label", default="")
+    sp.add_argument("--goal", default=None, help="Goal amount (e.g., 1000 or 1000.00)")
+    sp.add_argument("--unlock-at", default="", help='Unlock time (e.g., "now+2d" or "2026-04-13T18:30")')
+    sp.add_argument("--mode", default=VaultMode.BASIC, choices=VaultMode.ALL)
+    sp.set_defaults(func=cmd_vault_create)
+
+    sp = sub.add_parser("vaults", help="List a user's vaults")
+    sp.add_argument("--user", required=True)
+    sp.set_defaults(func=cmd_vaults)
+
+    sp = sub.add_parser("vault-goal", help="Set vault goal")
+    sp.add_argument("vault_id")
+    sp.add_argument("goal")
+    sp.add_argument("--user", required=True)
+    sp.set_defaults(func=cmd_vault_goal)
+
+    sp = sub.add_parser("vault-unlock", help="Set/extend vault unlock time")
+    sp.add_argument("vault_id")
+    sp.add_argument("--unlock-at", default="", help='Unlock time (e.g., "now+7d" or unix seconds)')
+    sp.add_argument("--user", required=True)
+    sp.set_defaults(func=cmd_vault_unlock)
+
+    sp = sub.add_parser("move-to-vault", help="Move funds from checking -> vault")
