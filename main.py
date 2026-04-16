@@ -1114,3 +1114,127 @@ def parse_duration(text: str) -> int:
     """
     text = (text or "").strip().lower().replace(" ", "")
     if not text:
+        raise ValidationError("Empty duration")
+    if text.isdigit():
+        return int(text)
+
+    total = 0
+    i = 0
+    while i < len(text):
+        j = i
+        while j < len(text) and text[j].isdigit():
+            j += 1
+        if j == i:
+            raise ValidationError(f"Bad duration at {text[i:]!r}")
+        num = int(text[i:j])
+        if j >= len(text):
+            raise ValidationError("Duration missing unit")
+        unit = text[j]
+        if unit == "s":
+            total += num
+        elif unit == "m":
+            total += num * 60
+        elif unit == "h":
+            total += num * 3600
+        elif unit == "d":
+            total += num * 86400
+        else:
+            raise ValidationError(f"Bad duration unit: {unit!r}")
+        i = j + 1
+    return total
+
+
+def parse_time(text: str) -> int:
+    """
+    Parse time formats:
+        - "now+2h", "now+90m"
+        - ISO-ish: "2026-04-13T18:30", "2026-04-13 18:30"
+        - unix seconds: "1713030000"
+    All interpreted as UTC if not explicit.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValidationError("Empty time")
+    if text.lower().startswith("now+"):
+        d = parse_duration(text[4:])
+        return now_ts() + d
+    if text.isdigit() and len(text) >= 9:
+        return int(text)
+    # Try parse date time
+    t = text.replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = _dt.datetime.strptime(t, fmt).replace(tzinfo=_dt.timezone.utc)
+            return int(dt.timestamp())
+        except ValueError:
+            pass
+    raise ValidationError(f"Unrecognized time: {text!r}")
+
+
+def _banner() -> str:
+    lines = [
+        c_title(f"{APP_NAME} v{APP_VERSION}"),
+        "Local AI bank account + savings manager (stdlib-only).",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _require_store(path: str) -> Store:
+    return load_store(path)
+
+
+def _print_kv(rows: List[Tuple[str, str]], indent: int = 0) -> None:
+    pad = " " * indent
+    width = max((len(k) for k, _ in rows), default=0)
+    for k, v in rows:
+        print(f"{pad}{k:<{width}}  {v}")
+
+
+def _hr() -> None:
+    print(_c("-" * 72, "2"))
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    init_store(path)
+    print(c_ok(f"Initialized store at {path}"))
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+
+    print(_banner())
+    rows = [
+        ("Store", path),
+        ("Schema", store.schema),
+        ("Created", fmt_dt(store.created_at)),
+        ("Updated", fmt_dt(store.updated_at)),
+        ("Liabilities", cents_to_money(store.liabilities_cents)),
+        ("Users", str(len(store.accounts))),
+        ("Vaults", str(sum(len(vs) for vs in store.vaults.values()))),
+        ("Pending", str(sum(len(ps) for ps in store.pending.values()))),
+        ("Schedules", str(sum(len(ss) for ss in store.schedules.values()))),
+    ]
+    _print_kv(rows)
+    _hr()
+    pr = [
+        ("deposit_fee_bps", str(store.policy.deposit_fee_bps)),
+        ("withdraw_fee_bps", str(store.policy.withdraw_fee_bps)),
+        ("vault_withdraw_fee_bps", str(store.policy.vault_withdraw_fee_bps)),
+        ("withdraw_delay", fmt_rel(store.policy.withdraw_delay_seconds)),
+        ("vault_withdraw_delay", fmt_rel(store.policy.vault_withdraw_delay_seconds)),
+        ("min_spacing", fmt_rel(store.policy.min_request_spacing_seconds)),
+        ("per_tx_max", cents_to_money(store.policy.per_tx_max_cents)),
+        ("per_day_soft", cents_to_money(store.policy.per_day_soft_limit_cents)),
+        ("enforce_soft_limit", str(int(store.policy.enforce_soft_limit))),
+        ("ai_model_tag", store.policy.ai_model_tag[:24] + "…"),
+        ("ai_epoch", str(store.policy.ai_epoch)),
+        ("audit_ring_size", str(store.policy.audit_ring_size)),
+    ]
+    _print_kv(pr)
+
+
+def cmd_user_show(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
