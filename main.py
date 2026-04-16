@@ -1238,3 +1238,127 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 def cmd_user_show(args: argparse.Namespace) -> None:
     path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    a = _ensure_account(store, user)
+    vaults = total_vault_balance(store, user)
+    health = account_health_bps(store, user)
+    rows = [
+        ("User", user),
+        ("Checking", cents_to_money(a.checking_cents)),
+        ("Vaults", cents_to_money(vaults)),
+        ("Health", f"{health} bps"),
+        ("Nonce", str(a.nonce)),
+        ("Last request", fmt_dt(a.last_request_at) if a.last_request_at else "never"),
+        ("Day outflow", cents_to_money(a.day_outflow_cents)),
+        ("Day index", str(a.day_idx)),
+    ]
+    print(_banner())
+    _print_kv(rows)
+
+
+def cmd_users(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    print(_banner())
+    us = list_users(store)
+    if not us:
+        print("(no users yet)")
+        return
+    for u in us:
+        a = store.accounts[u]
+        hv = account_health_bps(store, u)
+        print(f"- {u:<18}  checking={cents_to_money(a.checking_cents):>14}  health={hv:>5}bps")
+
+
+def cmd_deposit(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    amt = parse_money_to_cents(args.amount)
+    memo = args.memo or ""
+    deposit(store, user, amt, memo)
+    save_store(path, store)
+    print(c_ok(f"Deposited {cents_to_money(amt)} to {user} (memo={memo!r})"))
+
+
+def cmd_transfer(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    to = _norm_user(args.to)
+    amt = parse_money_to_cents(args.amount)
+    memo = args.memo or ""
+    internal_transfer(store, user, to, amt, memo)
+    save_store(path, store)
+    print(c_ok(f"Transferred {cents_to_money(amt)} from {user} -> {to}"))
+
+
+def cmd_vault_create(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    label = args.label or ""
+    mode = (args.mode or VaultMode.BASIC).lower()
+    goal = parse_money_to_cents(args.goal) if args.goal is not None else 0
+    unlock_at = parse_time(args.unlock_at) if args.unlock_at else 0
+    vid = vault_create(store, user, label, goal, unlock_at, mode)
+    save_store(path, store)
+    print(c_ok(f"Created vault #{vid} for {user} (mode={mode}, goal={cents_to_money(goal)})"))
+
+
+def cmd_vaults(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    rows = list_vaults(store, user)
+    print(_banner())
+    if not rows:
+        print("(no vaults)")
+        return
+    for v in rows:
+        lock = fmt_dt(v.unlock_at) if v.unlock_at else "—"
+        print(
+            f"- #{v.vault_id:<3} mode={v.mode:<9} bal={cents_to_money(v.balance_cents):>14} goal={cents_to_money(v.goal_cents):>12} unlock={lock} label={v.label!r}"
+        )
+
+
+def cmd_vault_goal(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    vid = int(args.vault_id)
+    goal = parse_money_to_cents(args.goal)
+    vault_set_goal(store, user, vid, goal)
+    save_store(path, store)
+    print(c_ok(f"Updated vault #{vid} goal -> {cents_to_money(goal)}"))
+
+
+def cmd_vault_unlock(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    vid = int(args.vault_id)
+    unlock_at = parse_time(args.unlock_at) if args.unlock_at else 0
+    vault_set_unlock(store, user, vid, unlock_at)
+    save_store(path, store)
+    print(c_ok(f"Updated vault #{vid} unlock -> {fmt_dt(unlock_at) if unlock_at else 'none'}"))
+
+
+def cmd_move_to_vault(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    vid = int(args.vault_id)
+    amt = parse_money_to_cents(args.amount)
+    move_to_vault(store, user, vid, amt)
+    save_store(path, store)
+    print(c_ok(f"Moved {cents_to_money(amt)} from checking -> vault #{vid}"))
+
+
+def cmd_move_from_vault(args: argparse.Namespace) -> None:
+    path = _store_path(args.store)
+    store = _require_store(path)
+    user = _norm_user(args.user)
+    vid = int(args.vault_id)
+    amt = parse_money_to_cents(args.amount)
