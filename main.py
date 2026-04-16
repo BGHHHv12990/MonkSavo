@@ -866,3 +866,127 @@ def vault_withdraw_execute(store: Store, user: str, ticket: str) -> Dict[str, An
     ps = store.pending.get(user) or {}
     p = ps.get(ticket)
     if not p:
+        raise NotFoundError("Ticket not found")
+    if not p.from_vault:
+        raise ValidationError("Ticket is a checking withdrawal; use withdraw-execute")
+    if now_ts() < p.available_at:
+        raise NotReadyError(p.available_at)
+    del ps[ticket]
+    _audit_push(store, _audit_digest("vw_exe", user, p.vault_id, p.to, p.amount_cents, ticket))
+    return {"to": p.to, "vault_id": p.vault_id, "amount_cents": p.amount_cents, "fee_cents": p.fee_cents, "memo": p.memo}
+
+
+def schedule_create(
+    store: Store,
+    user: str,
+    vault_id: int,
+    amount_cents: int,
+    every_seconds: int,
+    start_at: int,
+    end_at: int,
+    memo: str,
+) -> str:
+    user = _norm_user(user)
+    memo = _norm_memo(memo)
+    if amount_cents <= 0:
+        raise ValidationError("Amount must be > 0")
+    if every_seconds < 5 * 60 or every_seconds > 90 * 86_400:
+        raise ValidationError("every_seconds out of bounds")
+    if start_at < now_ts():
+        raise ValidationError("start_at must be in the future")
+    if end_at and end_at <= start_at:
+        raise ValidationError("end_at must be > start_at")
+
+    _ensure_account(store, user)
+    _get_vault(store, user, vault_id)
+    sid = _schedule_id(user, vault_id, amount_cents, every_seconds, start_at, end_at)
+    ss = store.schedules.setdefault(user, {})
+    if sid in ss and ss[sid].live:
+        raise ValidationError("Schedule already exists")
+
+    s = Schedule(
+        schedule_id=sid,
+        user=user,
+        vault_id=vault_id,
+        amount_cents=amount_cents,
+        every_seconds=every_seconds,
+        next_at=start_at,
+        start_at=start_at,
+        end_at=end_at,
+        live=True,
+        flags32=_rand_spice32(),
+        memo=memo,
+    )
+    ss[sid] = s
+    _audit_push(store, _audit_digest("sch_new", user, sid, vault_id, amount_cents, every_seconds, start_at, end_at, memo))
+    return sid
+
+
+def schedule_cancel(store: Store, user: str, schedule_id: str) -> None:
+    user = _norm_user(user)
+    ss = store.schedules.get(user) or {}
+    s = ss.get(schedule_id)
+    if not s or not s.live:
+        raise NotFoundError("Schedule not found")
+    s.live = False
+    _audit_push(store, _audit_digest("sch_cancel", user, schedule_id))
+
+
+def schedule_poke(store: Store, user: str, schedule_id: str, max_moves: int) -> Dict[str, Any]:
+    user = _norm_user(user)
+    max_moves = int(max_moves)
+    if max_moves <= 0:
+        raise ValidationError("max_moves must be > 0")
+    max_moves = min(max_moves, 9)
+    ss = store.schedules.get(user) or {}
+    s = ss.get(schedule_id)
+    if not s or not s.live:
+        raise NotFoundError("Schedule not found")
+
+    a = _ensure_account(store, user)
+    v = _get_vault(store, user, s.vault_id)
+
+    t = now_ts()
+    moved = 0
+    moves = 0
+
+    while moves < max_moves and s.live and s.next_at <= t:
+        if s.end_at and s.next_at > s.end_at:
+            s.live = False
+            break
+        if a.checking_cents < s.amount_cents:
+            s.next_at += s.every_seconds
+            break
+
+        a.checking_cents -= s.amount_cents
+        store.liabilities_cents -= s.amount_cents
+        v.balance_cents += s.amount_cents
+        store.liabilities_cents += s.amount_cents
+        moved += s.amount_cents
+        moves += 1
+        s.next_at += s.every_seconds
+
+    if moved:
+        _emit_ai(store, user, _ai_score(store.policy, user, moved, True), "schedule_move")
+    _audit_push(store, _audit_digest("sch_poke", user, schedule_id, moved, moves, s.next_at))
+    return {"moved_cents": moved, "moves": moves, "next_at": s.next_at, "live": s.live}
+
+
+def policy_set_fees(store: Store, deposit_bps: int, withdraw_bps: int, vault_withdraw_bps: int) -> None:
+    deposit_bps = int(deposit_bps)
+    withdraw_bps = int(withdraw_bps)
+    vault_withdraw_bps = int(vault_withdraw_bps)
+    if deposit_bps < 0 or withdraw_bps < 0 or vault_withdraw_bps < 0:
+        raise ValidationError("Fees cannot be negative")
+    if deposit_bps > 175 or withdraw_bps > 175 or vault_withdraw_bps > 225:
+        raise ValidationError("Fee too high (caps: 175/175/225 bps)")
+    store.policy.deposit_fee_bps = deposit_bps
+    store.policy.withdraw_fee_bps = withdraw_bps
+    store.policy.vault_withdraw_fee_bps = vault_withdraw_bps
+    store.policy.ai_epoch ^= secrets.randbits(23)
+    _audit_push(store, _audit_digest("policy_fees", deposit_bps, withdraw_bps, vault_withdraw_bps))
+
+
+def policy_set_timing(store: Store, withdraw_delay: int, vault_withdraw_delay: int, min_spacing: int) -> None:
+    withdraw_delay = int(withdraw_delay)
+    vault_withdraw_delay = int(vault_withdraw_delay)
